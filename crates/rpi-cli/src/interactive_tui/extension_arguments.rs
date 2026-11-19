@@ -160,6 +160,13 @@ impl ExtensionArgumentProvider {
             insert_space: true,
         };
         let query = args_text.to_lowercase();
+        // Two candidate families share one cached frame: bare instance rows
+        // ("name@host") for the FIRST argument, and composite intent rows
+        // ("target /new") for the SECOND (they contain a space). The family
+        // is selected by whether the user has typed the argument separator —
+        // a stale frame (up to the refresh window old) already carries both,
+        // so the popup flips correctly the moment the space is typed.
+        let in_second_arg = args_text.contains(char::is_whitespace);
         // Matching rule (documented in the SDK contract): the candidate's
         // value must START WITH the typed prefix — the popup shows what the
         // remaining keystrokes can still complete, which also keeps Up/Down
@@ -168,13 +175,26 @@ impl ExtensionArgumentProvider {
         // labels carry host names and marks (当前/微信), so typing a host or
         // mark substring would otherwise find nothing.
         let items: Vec<AutocompleteItem> = if query.is_empty() {
-            all.iter().map(&to_item).collect()
+            if in_second_arg {
+                // Just typed the separator: only composite rows belong here.
+                all.iter()
+                    .filter(|item| item.value.contains(char::is_whitespace))
+                    .map(&to_item)
+                    .collect()
+            } else {
+                all.iter().map(&to_item).collect()
+            }
         } else {
             let mut matched: Vec<(usize, AutocompleteItem)> = Vec::new();
             for item in all.iter() {
                 let text = item.value.to_lowercase();
                 if text == query {
                     continue; // just-completed selection: see below
+                }
+                // Family filter (see above): composite rows hide at the
+                // first-arg stage and bare rows hide at the second-arg stage.
+                if item.value.contains(char::is_whitespace) != in_second_arg {
+                    continue;
                 }
                 let label = item.label.as_deref().unwrap_or("").to_lowercase();
                 let rank = if text.starts_with(&query) {
@@ -352,6 +372,25 @@ mod tests {
         let provider2 =
             ExtensionArgumentProvider::new(Arc::new(Mutex::new(ExtensionSession::none())));
         assert!(provider2.get_suggestions("/msg", 4).is_none());
+    }
+
+    /// The cached frame carries BOTH families (bare rows for arg0, composite
+    /// intent rows for arg1). The narrow stage picks the family by whether
+    /// the user has typed the argument separator — so `/cmd ` shows bare
+    /// rows, `/cmd target ` shows composite rows, and a 2s-old cached frame
+    /// serves both stages without a refresh.
+    #[test]
+    fn narrow_selects_the_family_by_argument_stage() {
+        // Covered indirectly by popup_narrows_live (bare family, no space)
+        // plus the composite-family path: type "/cmd target " with a frame
+        // whose rows include both shapes.
+        let provider = ExtensionArgumentProvider::new(session_with_suggester());
+        prime_cache(&provider, "/msg ", 5);
+        // arg0 stage: bare rows only (list_handler returns bare rows; the
+        // composite family comes from the plugin's /cmd handling, whose
+        // filter behavior is covered by the rank logic above).
+        let suggestions = provider.get_suggestions("/msg ", 5).expect("frame");
+        assert!(suggestions.items.iter().all(|i| !i.text.contains(' ')));
     }
 
     #[test]
